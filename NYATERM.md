@@ -6,8 +6,16 @@ verified.
 
 - Fork: <https://github.com/nyakang/russh>
 - Upstream: <https://github.com/warp-tech/russh>
-- Base revision: `e5d80a07dc554480b6ea3b2e14adfc190407b627` (upstream `main`, 2026-10-13)
+- Base revision: `183a22e8f8f490fa09b6eb7bd044ef99d8c4414f` (fixed upstream target, 2026-11-03)
 - Branch: `nyaterm`
+
+## Current upstream sync (2026-11-03)
+
+Upstream pre-authentication keepalive rearming replaces the old sent-probe guard. Strict/Compatible modes, strict unanswered counts, and reply-free Compatible probes remain fork policy. Regression handlers use the upstream VerifiedPublicKey contract.
+
+Windows: 201 library tests; pre-auth keepalive, window-adjust and signer-failure integration tests; workspace fmt check; library clippy all passed. NyaTerm transport/terminal/VNC-helper check passed. Real SSH servers and other platforms were not exercised.
+
+Previous published revision: `3092e06cc827fc0f8d4c991280478f6e53c121a3`. Backup: `backup/nyaterm-20261103`. Older dated validation sections below describe historical baselines.
 
 ## Patches
 
