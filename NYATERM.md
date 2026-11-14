@@ -1,5 +1,18 @@
 # NyaTerm fork notes
 
+## Current upstream sync (2026-11-14)
+
+- Upstream base: `b541663a88381aab9f6af1af7bbadb02e155058a` (`https://github.com/Eugeny/russh`, `main`).
+- Previous published revision: `831c8ddd2898f472fb88e80a93cbf9beb40a0fe2`.
+- Preserved backup: `backup/nyaterm-20261114`; branch: `nyaterm`.
+
+Retain the pre-authentication keepalive patch. Drop the old VerifiedPublicKey test adaptation because upstream now supplies it. Keep upstream ssh-key rc12 and stable RSA 0.10, including certificate-CA rejection and signing hardening. The consumer uses the compatible SSPI/Picky fork graph.
+
+Windows, Rust 1.99.1: 207 library tests and auth_signer_failure, test_window_adjust, test_keepalive_before_auth integration tests passed against the rebased upstream dependency graph. Real SSH servers were not exercised.
+
+Earlier dated sections below describe historical revisions and validation.
+
+
 This branch tracks upstream `russh` with the patches documented below, so
 [NyaTerm](https://github.com/nyakang/nyaterm) compiles a revision that has been
 verified.
