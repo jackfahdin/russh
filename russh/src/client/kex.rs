@@ -67,6 +67,72 @@ fn canonicalize_ecdsa_signature(blob: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Verify an RSA host-key signature whose modulus is below the `rsa` crate's
+/// default floor.
+///
+/// `ssh-key`'s `Verifier` impl builds `rsa::PublicKey` with `MIN_SIZE = 1024`
+/// bits, so a 512–1023 bit server key fails before the signature is evaluated
+/// and russh surfaces `Error::WrongServerSig` even though the server signed
+/// correctly. Legacy appliances do this: Huawei VRP answers SSH2 with a
+/// 768-bit RSA host key and `rsa local-key-pair create` never changes it.
+///
+/// The rebound key is handed to the same PKCS#1 v1.5 verifier, so padding,
+/// DigestInfo and the signature comparison are unchanged; only the modulus
+/// size floor is relaxed. Anything that fails verification still fails.
+fn verify_short_rsa_host_key(key: &PublicKey, hash: &[u8], signature: &Signature) -> bool {
+    #[cfg(not(feature = "rsa"))]
+    {
+        let _ = (key, hash, signature);
+        false
+    }
+    #[cfg(feature = "rsa")]
+    {
+        use rsa::pkcs1v15;
+        use ssh_encoding::Uint;
+        use ssh_key::Algorithm;
+        use ssh_key::public::KeyData;
+        use signature::Verifier as _;
+
+        let KeyData::Rsa(rsa_key) = key.key_data() else {
+            return false;
+        };
+        let Algorithm::Rsa { hash: hash_algorithm } = signature.algorithm() else {
+            return false;
+        };
+        let (Ok(n), Ok(e)) = (Uint::try_from(rsa_key.n()), Uint::try_from(rsa_key.e())) else {
+            return false;
+        };
+        // Keys at or above the default floor already went through `ssh-key`;
+        // reaching this function means that path rejected them, so only the
+        // sub-1024 range is retried here.
+        if !(512..1024).contains(&(n.bit_width_vartime() as usize)) {
+            return false;
+        }
+        let Ok(public_key) = rsa::PublicKey::new_with_size_limits(n, e, 512..=1024) else {
+            return false;
+        };
+        let Ok(signature) = pkcs1v15::Signature::try_from(signature.as_bytes()) else {
+            return false;
+        };
+        match hash_algorithm {
+            None => pkcs1v15::VerifyingKey::<sha1::Sha1>::new(public_key)
+                .verify(hash, &signature)
+                .is_ok(),
+            Some(ssh_key::HashAlg::Sha256) => {
+                pkcs1v15::VerifyingKey::<sha2::Sha256>::new(public_key)
+                    .verify(hash, &signature)
+                    .is_ok()
+            }
+            Some(ssh_key::HashAlg::Sha512) => {
+                pkcs1v15::VerifyingKey::<sha2::Sha512>::new(public_key)
+                    .verify(hash, &signature)
+                    .is_ok()
+            }
+            Some(_) => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum ClientKexState {
@@ -404,8 +470,13 @@ impl ClientKex {
                 if let Err(e) =
                     signature::Verifier::verify(&server_host_key, hash.as_ref(), &signature)
                 {
-                    debug!("wrong server sig: {e:?}");
-                    return Err(Error::WrongServerSig);
+                    if !self.config.allow_short_rsa_host_keys
+                        || !verify_short_rsa_host_key(&server_host_key, hash.as_ref(), &signature)
+                    {
+                        debug!("wrong server sig: {e:?}");
+                        return Err(Error::WrongServerSig);
+                    }
+                    debug!("accepted sub-1024-bit RSA host key signature (legacy compatibility)");
                 }
 
                 let agent_session_binding = (!self.cause.is_rekey()).then(|| {
@@ -647,5 +718,144 @@ mod negotiated_host_key_algorithm_tests {
             key.public_key(),
             &sign(Some(HashAlg::Sha512))
         ));
+    }
+}
+
+/// Covers the sub-1024-bit RSA host-key fallback (`verify_short_rsa_host_key`).
+///
+/// The key below is a real 768-bit RSA key: Huawei VRP appliances answer SSH2
+/// with exactly this size and `rsa local-key-pair create` never changes it.
+#[cfg(all(test, feature = "rsa"))]
+mod short_rsa_host_key_tests {
+    use rsa::BoxedUint;
+    use rsa::pkcs1v15::Pkcs1v15Sign;
+    use sha1::{Digest, Sha1};
+    use ssh_key::public::{KeyData, RsaPublicKey};
+    use ssh_key::{Algorithm, Mpint, PublicKey, Signature};
+
+    use super::verify_short_rsa_host_key;
+
+    const N: &str = "8d24e5c4a7b80108a1f1080faca3561e3a93ab4aae0d13932b5d7a1a6bab2666af7e4364f2a3465db30b50a2adf4656d61ef6a9c17c6dc92e5ddf8d894b945d99355a23ac7c86d26521423a08ee273afc6ff6ee935312dd4587374617714d473";
+    const E: &str = "010001";
+    const D: &str = "0585a007a59829523123c0f0fc0c17de6ee4401b57dbe31c2ae22958c74596e7058ea70c5801d34aef2a4e294f2cf49ad795ee6cc1e5b7d6b41aa33a6c5dc6b571c31fc2b9bbfebd51f9afff4ad084a3fc3ff8c259ffcb258776077a393db981";
+    const P: &str = "f44918600410929ab19250a82c5ffcace053021d8da2d013006ddda34b8455cca91c71d1d8baaa829649601d41c92231";
+    const Q: &str = "93e99d72c2643e5875a8c73c07ae0bbf9f6252d99555178d74e4c74a0fddf8b1e793697d53766608698c084289f7f3e3";
+
+    fn bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn private_key() -> rsa::PrivateKey {
+        rsa::PrivateKey::from_components(
+            BoxedUint::from_be_slice_vartime(&bytes(N)),
+            BoxedUint::from_be_slice_vartime(&bytes(E)),
+            BoxedUint::from_be_slice_vartime(&bytes(D)),
+            vec![
+                BoxedUint::from_be_slice_vartime(&bytes(P)),
+                BoxedUint::from_be_slice_vartime(&bytes(Q)),
+            ],
+        )
+        .expect("fixture key is consistent")
+    }
+
+    fn public_key(n: &str) -> PublicKey {
+        let rsa = RsaPublicKey::new(
+            Mpint::from_positive_bytes(&bytes(E)),
+            Mpint::from_positive_bytes(&bytes(n)),
+        )
+        .unwrap();
+        PublicKey::new(KeyData::Rsa(rsa), "")
+    }
+
+    fn sign(private: &rsa::PrivateKey, exchange_hash: &[u8]) -> Signature {
+        let digest = Sha1::digest(exchange_hash);
+        let signature = private.sign(Pkcs1v15Sign::new::<Sha1>(), &digest).unwrap();
+        Signature::new(Algorithm::Rsa { hash: None }, signature).unwrap()
+    }
+
+    #[test]
+    fn standard_verifier_rejects_short_key_without_evaluating_the_signature() {
+        let private = private_key();
+        let public = public_key(N);
+        let exchange_hash = [7u8; 32];
+        let signature = sign(&private, &exchange_hash);
+        assert!(
+            signature::Verifier::verify(&public, &exchange_hash, &signature).is_err(),
+            "the stock path must still fail: this is the reported bug"
+        );
+    }
+
+    #[test]
+    fn accepts_a_valid_768_bit_host_key_signature() {
+        let private = private_key();
+        let public = public_key(N);
+        let exchange_hash = [7u8; 32];
+        let signature = sign(&private, &exchange_hash);
+        assert!(verify_short_rsa_host_key(
+            &public,
+            &exchange_hash,
+            &signature
+        ));
+    }
+
+    #[test]
+    fn rejects_a_tampered_signature() {
+        let private = private_key();
+        let public = public_key(N);
+        let exchange_hash = [7u8; 32];
+        let mut signature = sign(&private, &exchange_hash);
+        let mut raw = signature.as_bytes().to_vec();
+        let last = raw.last_mut().unwrap();
+        *last ^= 0x01;
+        signature = Signature::new(Algorithm::Rsa { hash: None }, raw).unwrap();
+        assert!(!verify_short_rsa_host_key(
+            &public,
+            &exchange_hash,
+            &signature
+        ));
+    }
+
+    #[test]
+    fn rejects_a_signature_over_a_different_exchange_hash() {
+        let private = private_key();
+        let public = public_key(N);
+        let signature = sign(&private, &[7u8; 32]);
+        assert!(!verify_short_rsa_host_key(&public, &[9u8; 32], &signature));
+    }
+
+    #[test]
+    fn ignores_keys_at_or_above_the_default_floor() {
+        let private = private_key();
+        let mut wide = vec![0x80u8];
+        wide.extend([0x11u8; 127]);
+        let public = public_key(&wide.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let signature = sign(&private, &[7u8; 32]);
+        assert!(
+            !verify_short_rsa_host_key(&public, &[7u8; 32], &signature),
+            "1024-bit keys must go through ssh-key, not the fallback"
+        );
+    }
+
+    #[test]
+    fn ignores_non_rsa_keys() {
+        let ed25519 = ssh_key::PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .unwrap()
+            .public_key()
+            .clone();
+        let signature = Signature::new(Algorithm::Rsa { hash: None }, vec![0u8; 96]).unwrap();
+        assert!(!verify_short_rsa_host_key(&ed25519, &[7u8; 32], &signature));
+    }
+
+    #[test]
+    fn ignores_keys_below_the_smallest_supported_size() {
+        let private = private_key();
+        let mut tiny = vec![0x00u8];
+        tiny.extend([0x11u8; 32]);
+        let public = public_key(&tiny.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let signature = sign(&private, &[7u8; 32]);
+        assert!(!verify_short_rsa_host_key(&public, &[7u8; 32], &signature));
     }
 }

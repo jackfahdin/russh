@@ -2839,6 +2839,16 @@ pub struct Config {
     pub gex: GexParams,
     /// If active, invoke `set_nodelay(true)` on the ssh socket; disabled by default (i.e. Nagle's algorithm is active).
     pub nodelay: bool,
+    /// Accept RSA server host keys shorter than 1024 bits (legacy appliances).
+    ///
+    /// `ssh-key` builds `rsa::PublicKey` with the crate's default 1024-bit
+    /// floor, so a 512–1023 bit server key fails before its signature is even
+    /// evaluated and the handshake reports `WrongServerSig`. When this is
+    /// enabled, such keys are verified through the same PKCS#1 v1.5 verifier
+    /// with an explicit lower size limit: padding, digest and the full
+    /// signature check still apply, only the modulus size floor is relaxed.
+    /// Disabled by default.
+    pub allow_short_rsa_host_keys: bool,
 }
 
 impl Default for Config {
@@ -2862,6 +2872,7 @@ impl Default for Config {
             anonymous: false,
             gex: Default::default(),
             nodelay: false,
+            allow_short_rsa_host_keys: false,
         }
     }
 }

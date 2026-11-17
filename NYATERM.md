@@ -1,5 +1,32 @@
 # NyaTerm fork notes
 
+## 2026-11-17 sub-1024-bit RSA host keys
+
+`ssh-key`'s `Verifier for RsaPublicKey` builds `rsa::PublicKey` with the crate
+default `MIN_SIZE = 1024`, so a 512–1023 bit server key fails before the
+signature is evaluated and the handshake reports `Error::WrongServerSig`. Real
+appliances do this: Huawei S2326TP-EI (VRP 5.70, S2300 V100R005C01SPC100) serves
+a 768-bit `ssh-rsa` host key and signs correctly. `rsa local-key-pair create`
+with 2048 bits, `rsa local-key-pair destroy`, `save` and a restart all leave
+that key untouched — the probe fingerprint stayed identical before and after.
+
+Added `client::Config::allow_short_rsa_host_keys` (default `false`). When the
+standard verification fails, RSA keys in `512..1024` bits are re-verified
+through the same PKCS#1 v1.5 verifier built with `PublicKey::new_with_size_limits`
+so padding, DigestInfo and the signature comparison are unchanged; only the
+modulus size floor moves. Keys at or above the floor, non-RSA keys and keys
+below 512 bits never take the fallback, and a failed fallback still returns
+`WrongServerSig`.
+
+Validation on Windows 11, Rust 1.99.1:
+`cargo test -p russh --lib` (214 passed, including 7 new cases in
+`client::kex::short_rsa_host_key_tests`: valid 768-bit signature accepted;
+tampered signature, foreign exchange hash, 1024-bit key, Ed25519 key and 264-bit
+key all rejected), `cargo fmt --all -- --check`, `cargo clippy -p russh --lib`
+(no new warnings). Against the live device: the flag off reproduces
+`Wrong server signature`; the flag on completes the handshake. Windows only;
+other platforms and other appliances were not exercised.
+
 ## Current upstream sync (2026-11-14)
 
 - Upstream base: `b541663a88381aab9f6af1af7bbadb02e155058a` (`https://github.com/Eugeny/russh`, `main`).
