@@ -1,5 +1,23 @@
 # NyaTerm fork notes
 
+## 2026-11-18 explicit short-RSA verification coverage
+
+The exchange verifier now uses one tested verification gate: the ordinary
+verifier always runs first; only an explicit `allow_short_rsa_host_keys` opt-in
+permits the existing 512–1023-bit RSA fallback. Host identity checking and
+signature verification remain required.
+
+Replaced embedded private-key test components with test-only, in-memory key
+generation (`rsa/hazmat` is enabled only through the development dependency).
+Added exchange-gate tests for opt-in off/on, SHA-256 and SHA-512 signatures,
+foreign exchange hashes, and normal 1024-bit RSA verification under both flags.
+
+Validation: Linux x86_64, Rust 1.99.1, `cargo test -p russh --lib`:
+230 passed; `cargo clippy -p russh --lib` passed with existing warnings;
+`cargo fmt -p russh -- --check` passed. No physical legacy appliance was
+available for this follow-up.
+
+
 ## 2026-11-17 sub-1024-bit RSA host keys
 
 `ssh-key`'s `Verifier for RsaPublicKey` builds `rsa::PublicKey` with the crate

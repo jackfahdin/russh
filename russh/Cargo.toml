@@ -92,6 +92,7 @@ universal-hash = "0.6.1" # only pinned due to a cargo-minimal-versions failure i
 zeroize = "1.7"
 
 [dev-dependencies]
+rsa = { version = "0.10", features = ["hazmat"] }
 anyhow = "1.0.4"
 clap = { version = "4", features = ["derive"] }
 env_logger.workspace = true

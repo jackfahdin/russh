@@ -67,6 +67,11 @@ fn canonicalize_ecdsa_signature(blob: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+fn verify_host_key_signature(key: &PublicKey, hash: &[u8], signature: &Signature, allow_short: bool) -> bool {
+    signature::Verifier::verify(key, hash, signature).is_ok()
+        || (allow_short && verify_short_rsa_host_key(key, hash, signature))
+}
+
 /// Verify an RSA host-key signature whose modulus is below the `rsa` crate's
 /// default floor.
 ///
@@ -467,16 +472,9 @@ impl ClientKex {
                     return Err(Error::WrongServerSig);
                 }
 
-                if let Err(e) =
-                    signature::Verifier::verify(&server_host_key, hash.as_ref(), &signature)
-                {
-                    if !self.config.allow_short_rsa_host_keys
-                        || !verify_short_rsa_host_key(&server_host_key, hash.as_ref(), &signature)
-                    {
-                        debug!("wrong server sig: {e:?}");
-                        return Err(Error::WrongServerSig);
-                    }
-                    debug!("accepted sub-1024-bit RSA host key signature (legacy compatibility)");
+                if !verify_host_key_signature(&server_host_key, hash.as_ref(), &signature, self.config.allow_short_rsa_host_keys) {
+                    debug!("wrong server sig");
+                    return Err(Error::WrongServerSig);
                 }
 
                 let agent_session_binding = (!self.cause.is_rekey()).then(|| {
@@ -723,42 +721,34 @@ mod negotiated_host_key_algorithm_tests {
 
 /// Covers the sub-1024-bit RSA host-key fallback (`verify_short_rsa_host_key`).
 ///
-/// The key below is a real 768-bit RSA key: Huawei VRP appliances answer SSH2
-/// with exactly this size and `rsa local-key-pair create` never changes it.
+/// Keys are generated in memory for tests; no real device credentials are used.
 #[cfg(all(test, feature = "rsa"))]
 mod short_rsa_host_key_tests {
-    use rsa::BoxedUint;
+    use rsa::traits::PublicKeyParts as _;
     use rsa::pkcs1v15::Pkcs1v15Sign;
     use sha1::{Digest, Sha1};
     use ssh_key::public::{KeyData, RsaPublicKey};
     use ssh_key::{Algorithm, Mpint, PublicKey, Signature};
 
-    use super::verify_short_rsa_host_key;
+    use super::{verify_short_rsa_host_key, verify_host_key_signature};
 
-    const N: &str = "8d24e5c4a7b80108a1f1080faca3561e3a93ab4aae0d13932b5d7a1a6bab2666af7e4364f2a3465db30b50a2adf4656d61ef6a9c17c6dc92e5ddf8d894b945d99355a23ac7c86d26521423a08ee273afc6ff6ee935312dd4587374617714d473";
     const E: &str = "010001";
-    const D: &str = "0585a007a59829523123c0f0fc0c17de6ee4401b57dbe31c2ae22958c74596e7058ea70c5801d34aef2a4e294f2cf49ad795ee6cc1e5b7d6b41aa33a6c5dc6b571c31fc2b9bbfebd51f9afff4ad084a3fc3ff8c259ffcb258776077a393db981";
-    const P: &str = "f44918600410929ab19250a82c5ffcace053021d8da2d013006ddda34b8455cca91c71d1d8baaa829649601d41c92231";
-    const Q: &str = "93e99d72c2643e5875a8c73c07ae0bbf9f6252d99555178d74e4c74a0fddf8b1e793697d53766608698c084289f7f3e3";
 
     fn bytes(hex: &str) -> Vec<u8> {
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect()
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
     }
 
+    // Test-only generation avoids embedding any appliance's private key.
     fn private_key() -> rsa::PrivateKey {
-        rsa::PrivateKey::from_components(
-            BoxedUint::from_be_slice_vartime(&bytes(N)),
-            BoxedUint::from_be_slice_vartime(&bytes(E)),
-            BoxedUint::from_be_slice_vartime(&bytes(D)),
-            vec![
-                BoxedUint::from_be_slice_vartime(&bytes(P)),
-                BoxedUint::from_be_slice_vartime(&bytes(Q)),
-            ],
-        )
-        .expect("fixture key is consistent")
+        static KEY: std::sync::OnceLock<rsa::PrivateKey> = std::sync::OnceLock::new();
+        KEY.get_or_init(|| rsa::PrivateKey::new_unchecked(&mut rand::rng(), 768).unwrap()).clone()
+    }
+
+    fn matching_public(private: &rsa::PrivateKey) -> PublicKey {
+        PublicKey::new(KeyData::Rsa(RsaPublicKey::new(
+            Mpint::from_positive_bytes(&private.e().to_be_bytes()),
+            Mpint::from_positive_bytes(&private.n().to_be_bytes()),
+        ).unwrap()), "")
     }
 
     fn public_key(n: &str) -> PublicKey {
@@ -779,7 +769,7 @@ mod short_rsa_host_key_tests {
     #[test]
     fn standard_verifier_rejects_short_key_without_evaluating_the_signature() {
         let private = private_key();
-        let public = public_key(N);
+        let public = matching_public(&private);
         let exchange_hash = [7u8; 32];
         let signature = sign(&private, &exchange_hash);
         assert!(
@@ -791,7 +781,7 @@ mod short_rsa_host_key_tests {
     #[test]
     fn accepts_a_valid_768_bit_host_key_signature() {
         let private = private_key();
-        let public = public_key(N);
+        let public = matching_public(&private);
         let exchange_hash = [7u8; 32];
         let signature = sign(&private, &exchange_hash);
         assert!(verify_short_rsa_host_key(
@@ -804,7 +794,7 @@ mod short_rsa_host_key_tests {
     #[test]
     fn rejects_a_tampered_signature() {
         let private = private_key();
-        let public = public_key(N);
+        let public = matching_public(&private);
         let exchange_hash = [7u8; 32];
         let mut signature = sign(&private, &exchange_hash);
         let mut raw = signature.as_bytes().to_vec();
@@ -821,7 +811,7 @@ mod short_rsa_host_key_tests {
     #[test]
     fn rejects_a_signature_over_a_different_exchange_hash() {
         let private = private_key();
-        let public = public_key(N);
+        let public = matching_public(&private);
         let signature = sign(&private, &[7u8; 32]);
         assert!(!verify_short_rsa_host_key(&public, &[9u8; 32], &signature));
     }
@@ -858,4 +848,42 @@ mod short_rsa_host_key_tests {
         let signature = sign(&private, &[7u8; 32]);
         assert!(!verify_short_rsa_host_key(&public, &[7u8; 32], &signature));
     }
+    #[test]
+    fn short_key_requires_explicit_opt_in_in_the_exchange_verifier() {
+        assert!(!crate::client::Config::default().allow_short_rsa_host_keys);
+        let private = private_key();
+        let public = matching_public(&private);
+        let signature = sign(&private, &[7u8; 32]);
+        assert!(!verify_host_key_signature(&public, &[7u8; 32], &signature, false));
+        assert!(verify_host_key_signature(&public, &[7u8; 32], &signature, true));
+        assert!(!verify_host_key_signature(&public, &[9u8; 32], &signature, true));
+    }
+
+    #[test]
+    fn short_keys_verify_sha2_signatures_without_accepting_mismatched_hashes() {
+        use sha2::{Sha256, Sha512};
+        let private = private_key();
+        let public = matching_public(&private);
+        for (algorithm, padding, digest) in [
+            (ssh_key::HashAlg::Sha256, Pkcs1v15Sign::new::<Sha256>(), Sha256::digest([7u8; 32]).to_vec()),
+            (ssh_key::HashAlg::Sha512, Pkcs1v15Sign::new::<Sha512>(), Sha512::digest([7u8; 32]).to_vec()),
+        ] {
+            let raw = private.sign(padding, &digest).unwrap();
+            let signature = Signature::new(Algorithm::Rsa { hash: Some(algorithm) }, raw).unwrap();
+            assert!(verify_host_key_signature(&public, &[7u8; 32], &signature, true));
+            assert!(!verify_host_key_signature(&public, &[9u8; 32], &signature, true));
+        }
+    }
+
+    #[test]
+    fn normal_rsa_keys_keep_the_standard_signature_checks() {
+        let private = rsa::PrivateKey::new(&mut rand::rng(), 1024).unwrap();
+        let public = matching_public(&private);
+        let signature = sign(&private, &[7u8; 32]);
+        for allow in [false, true] {
+            assert!(verify_host_key_signature(&public, &[7u8; 32], &signature, allow));
+            assert!(!verify_host_key_signature(&public, &[9u8; 32], &signature, allow));
+        }
+    }
+
 }
