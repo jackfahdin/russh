@@ -1,5 +1,15 @@
 # NyaTerm fork notes
 
+## Upstream synchronization (2026-11-25)
+
+- Upstream base: `ba6e2c165ccc71761004560cbd590d64db09b25d` (Eugeny/russh, main).
+- Previous published head: `25446652f68d69fc78037fadb6b645885da64e35`.
+- Preserved remote backup: `backup/nyaterm-20261125-25446652`.
+
+Retain strict/compatible keepalives, legacy ECDSA compatibility, explicit short RSA opt-in and upstream negotiated host-key/signature algorithm checks. Preserve both upstream and fork regression suites.
+
+Linux x86_64, Rust 1.99.1: 244 library tests, three signer-failure, two pre-auth keepalive and one window-adjust integration tests passed. Package library Clippy and workspace formatting checks passed. Real appliances and Windows/macOS were not exercised.
+
 ## 2026-11-18 explicit short-RSA verification coverage
 
 The exchange verifier now uses one tested verification gate: the ordinary
