@@ -1,5 +1,60 @@
 # NyaTerm fork notes
 
+## Upstream synchronization (2026-11-25)
+
+- Upstream base: `ba6e2c165ccc71761004560cbd590d64db09b25d` (Eugeny/russh, main).
+- Previous published head: `25446652f68d69fc78037fadb6b645885da64e35`.
+- Preserved remote backup: `backup/nyaterm-20261125-25446652`.
+
+Retain strict/compatible keepalives, legacy ECDSA compatibility, explicit short RSA opt-in and upstream negotiated host-key/signature algorithm checks. Preserve both upstream and fork regression suites.
+
+Linux x86_64, Rust 1.99.1: 244 library tests, three signer-failure, two pre-auth keepalive and one window-adjust integration tests passed. Package library Clippy and workspace formatting checks passed. Real appliances and Windows/macOS were not exercised.
+
+## 2026-11-18 explicit short-RSA verification coverage
+
+The exchange verifier now uses one tested verification gate: the ordinary
+verifier always runs first; only an explicit `allow_short_rsa_host_keys` opt-in
+permits the existing 512–1023-bit RSA fallback. Host identity checking and
+signature verification remain required.
+
+Replaced embedded private-key test components with test-only, in-memory key
+generation (`rsa/hazmat` is enabled only through the development dependency).
+Added exchange-gate tests for opt-in off/on, SHA-256 and SHA-512 signatures,
+foreign exchange hashes, and normal 1024-bit RSA verification under both flags.
+
+Validation: Linux x86_64, Rust 1.99.1, `cargo test -p russh --lib`:
+230 passed; `cargo clippy -p russh --lib` passed with existing warnings;
+`cargo fmt -p russh -- --check` passed. No physical legacy appliance was
+available for this follow-up.
+
+
+## 2026-11-17 sub-1024-bit RSA host keys
+
+`ssh-key`'s `Verifier for RsaPublicKey` builds `rsa::PublicKey` with the crate
+default `MIN_SIZE = 1024`, so a 512–1023 bit server key fails before the
+signature is evaluated and the handshake reports `Error::WrongServerSig`. Real
+appliances do this: Huawei S2326TP-EI (VRP 5.70, S2300 V100R005C01SPC100) serves
+a 768-bit `ssh-rsa` host key and signs correctly. `rsa local-key-pair create`
+with 2048 bits, `rsa local-key-pair destroy`, `save` and a restart all leave
+that key untouched — the probe fingerprint stayed identical before and after.
+
+Added `client::Config::allow_short_rsa_host_keys` (default `false`). When the
+standard verification fails, RSA keys in `512..1024` bits are re-verified
+through the same PKCS#1 v1.5 verifier built with `PublicKey::new_with_size_limits`
+so padding, DigestInfo and the signature comparison are unchanged; only the
+modulus size floor moves. Keys at or above the floor, non-RSA keys and keys
+below 512 bits never take the fallback, and a failed fallback still returns
+`WrongServerSig`.
+
+Validation on Windows 11, Rust 1.99.1:
+`cargo test -p russh --lib` (214 passed, including 7 new cases in
+`client::kex::short_rsa_host_key_tests`: valid 768-bit signature accepted;
+tampered signature, foreign exchange hash, 1024-bit key, Ed25519 key and 264-bit
+key all rejected), `cargo fmt --all -- --check`, `cargo clippy -p russh --lib`
+(no new warnings). Against the live device: the flag off reproduces
+`Wrong server signature`; the flag on completes the handshake. Windows only;
+other platforms and other appliances were not exercised.
+
 ## Current upstream sync (2026-11-14)
 
 - Upstream base: `b541663a88381aab9f6af1af7bbadb02e155058a` (`https://github.com/Eugeny/russh`, `main`).

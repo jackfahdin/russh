@@ -48,7 +48,7 @@ use kex::ClientKex;
 use log::{debug, error, trace, warn};
 use russh_util::time::Instant;
 use ssh_encoding::{Decode, Encode};
-use ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
+use ssh_key::{Algorithm, Certificate, HashAlg, PublicKey};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::pin;
 use tokio::sync::mpsc::{
@@ -103,6 +103,8 @@ pub struct Session {
     server_sig_algs: Option<Vec<Algorithm>>,
     /// Number of EXT_INFO messages received (RFC 8308 allows at most two).
     ext_info_count: u8,
+    /// USERAUTH_REQUESTs sent and not yet answered with success or failure
+    pending_auth_requests: usize,
 }
 
 impl Drop for Session {
@@ -119,7 +121,6 @@ enum Reply {
         proceed_with_methods: MethodSet,
         partial_success: bool,
     },
-    ChannelOpenFailure,
     SignRequest {
         key: ssh_key::PublicKey,
         data: Vec<u8>,
@@ -506,11 +507,36 @@ impl<H: Handler> Handle<H> {
         self.wait_recv_reply().await
     }
 
+    /// Perform public key-based SSH authentication without first probing
+    /// whether the server accepts the key.
+    ///
+    /// Some servers reject the unsigned probe
+    pub async fn authenticate_publickey_direct<U: Into<String>>(
+        &mut self,
+        user: U,
+        key: PrivateKeyWithHashAlg,
+    ) -> Result<AuthResult, crate::Error> {
+        let user = user.into();
+        self.sender
+            .send(Msg::Authenticate {
+                user,
+                method: auth::Method::PublicKeyDirect { key },
+            })
+            .await
+            .map_err(|_| crate::Error::SendError)?;
+        self.wait_recv_reply().await
+    }
+
     /// Perform public OpenSSH Certificate-based SSH authentication
+    ///
+    /// For RSA keys, the hash algorithm of `key` is used for both the
+    /// certificate type in the request and the signature.
+    /// [`Handle::best_supported_rsa_hash`] returns the best hash the server
+    /// supports
     pub async fn authenticate_openssh_cert<U: Into<String>>(
         &mut self,
         user: U,
-        key: Arc<PrivateKey>,
+        key: PrivateKeyWithHashAlg,
         cert: Certificate,
     ) -> Result<AuthResult, crate::Error> {
         let user = user.into();
@@ -1335,6 +1361,7 @@ impl Session {
             open_global_requests: VecDeque::new(),
             server_sig_algs: None,
             ext_info_count: 0,
+            pending_auth_requests: 0,
         }
     }
 
@@ -2120,6 +2147,7 @@ mod tests {
     use std::sync::Arc;
 
     use ssh_encoding::Encode;
+    use ssh_key::PrivateKey;
     use tokio::sync::mpsc::{channel, unbounded_channel};
 
     use super::*;
@@ -2155,7 +2183,7 @@ mod tests {
         let auth_request = AuthRequest::new(&Method::KeyboardInteractive {
             submethods: String::new(),
         });
-        let session = Session::new(
+        let mut session = Session::new(
             config.window_size,
             CommonSession {
                 auth_user: "user".to_owned(),
@@ -2197,6 +2225,7 @@ mod tests {
             receiver,
             reply_sender,
         );
+        session.pending_auth_requests = 1;
         (session, sender, reply_receiver)
     }
 
@@ -2286,6 +2315,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsolicited_userauth_failure_is_rejected() {
+        let (mut session, _sender, mut replies) = keyboard_interactive_session();
+        let mut packet = vec![msg::USERAUTH_FAILURE];
+        "password".encode(&mut packet).unwrap();
+        0u8.encode(&mut packet).unwrap();
+
+        session
+            .process_packet(&mut TestHandler, &packet)
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.process_packet(&mut TestHandler, &packet).await,
+            Err(crate::Error::Inconsistent)
+        ));
+        assert!(matches!(replies.try_recv(), Ok(Reply::AuthFailure { .. })));
+        assert!(replies.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn third_ext_info_is_rejected() {
         let (mut session, _sender, _reply) = keyboard_interactive_session();
         let mut packet = vec![msg::EXT_INFO];
@@ -2360,6 +2408,23 @@ mod tests {
             reply.try_recv(),
             Ok(Err(crate::Error::RequestDenied))
         ));
+    }
+
+    #[tokio::test]
+    async fn global_request_is_answered_only_if_it_wants_a_reply() {
+        let (mut session, _sender, _replies) = keyboard_interactive_session();
+        session.common.encrypted.as_mut().unwrap().state = EncryptedState::Authenticated;
+        for want_reply in [0, 1] {
+            let packet = [msg::GLOBAL_REQUEST, 0, 0, 0, 1, b'x', want_reply];
+            session
+                .process_packet(&mut TestHandler, &packet)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            session.common.encrypted.as_ref().unwrap().write,
+            [0, 0, 0, 1, msg::REQUEST_FAILURE]
+        );
     }
 
     /// `keyboard_interactive_session` negotiates the `none` kex, which cannot
@@ -2774,6 +2839,16 @@ pub struct Config {
     pub gex: GexParams,
     /// If active, invoke `set_nodelay(true)` on the ssh socket; disabled by default (i.e. Nagle's algorithm is active).
     pub nodelay: bool,
+    /// Accept RSA server host keys shorter than 1024 bits (legacy appliances).
+    ///
+    /// `ssh-key` builds `rsa::PublicKey` with the crate's default 1024-bit
+    /// floor, so a 512–1023 bit server key fails before its signature is even
+    /// evaluated and the handshake reports `WrongServerSig`. When this is
+    /// enabled, such keys are verified through the same PKCS#1 v1.5 verifier
+    /// with an explicit lower size limit: padding, digest and the full
+    /// signature check still apply, only the modulus size floor is relaxed.
+    /// Disabled by default.
+    pub allow_short_rsa_host_keys: bool,
 }
 
 impl Default for Config {
@@ -2797,6 +2872,7 @@ impl Default for Config {
             anonymous: false,
             gex: Default::default(),
             nodelay: false,
+            allow_short_rsa_host_keys: false,
         }
     }
 }
